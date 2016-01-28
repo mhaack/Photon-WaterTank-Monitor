@@ -21,6 +21,7 @@ retained unsigned int lastDistances[MEASUREMENTS]; // last n distance values sto
 // measurement and publish interval
 const unsigned int MEASUREMENT_INTERVAL = 60 * 15; // 15 minutes for normal readings
 const unsigned int PUBLISH_INTERVAL = 60 * 60; // 1 hour as regular publish interval
+const unsigned int TIMESYNC_INTERVAL = 24 * 60 * 60; // 1 day to update cloud time
 
 char publishString[128];
 
@@ -75,9 +76,11 @@ void loop() {
           sprintf(publishString,"{\"cm\": %lu, \"wifi\": %d, \"v\": %.2f, \"soc\": %.2f, \"alert\": %d, \"fp\": %d}",
             current, WiFi.RSSI(), lipo.getVoltage(), lipo.getSOC(), lipo.getAlert(), force ? 1 : 0);
           Serial.println(publishString);
-          Particle.publish("water-sensor",publishString);
+          Particle.publish("water-sensor", publishString, PRIVATE);
           Particle.process();
           delay(1000);
+
+          timeSync();
         }
 
         if (mode == 2) {
@@ -147,14 +150,27 @@ void shiftLastDistances(unsigned int newDistance) {
   lastDistances[0] = newDistance;
 }
 
-// call sleep time till next measurement
+// sync RTC time with cloud
+void timeSync() {
+  time_t now = Time.now();
+  time_t lastInterval = now - (now % TIMESYNC_INTERVAL);
+  if (now - lastInterval < 10) {
+      Serial.println("force time sync");
+      Particle.syncTime();
+      Particle.publish("water-sensor-time", "done");
+      Serial.println("time sync done");
+      delay(2000);
+  }
+}
+
+// calc sleep time till next measurement
 int sleepTime() {
   time_t now = Time.now();
   time_t nextInterval = now - (now % MEASUREMENT_INTERVAL) + MEASUREMENT_INTERVAL;
   Serial.printf("now %s", asctime(gmtime(&now)));
-  Serial.printf("next %s", asctime(gmtime(&nextInterval)));
-  delay(10); // needed for serial print before going into sleep
-  return nextInterval-now;
+  Serial.printf("next measurement %s", asctime(gmtime(&nextInterval)));
+  delay(10); // needed to give serial time to print before going into sleep
+  return nextInterval - now;
 }
 
 // calc if a force publish is needed to send updates on defined intervals
