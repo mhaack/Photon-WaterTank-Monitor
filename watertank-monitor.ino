@@ -45,11 +45,11 @@ void loop() {
         powerState = !powerState;
         Serial.printlnf("Sensor power: %s", powerState ? "on" : "off");
         digitalWrite(powerControl, powerState);
-        delay(500);
+        delay(250);
 
         for(int i = 0; i < MEASUREMENTS; i++) {
-          ping(sensorTrigger, sensorEcho, 100, i);
-          Serial.printlnf("Measurement %d: %lu", i, distance[i]);
+                ping(sensorTrigger, sensorEcho, 100, i);
+                Serial.printlnf("Measurement %d: %lu", i, distance[i]);
         }
         powerState = !powerState;
         Serial.printlnf("Sensor power: %s", powerState ? "on" : "off");
@@ -69,26 +69,26 @@ void loop() {
         // publish results
         bool force = forcePublish();
         if (force || !inRange) {
-          Serial.println("Publish results to cloud");
-          Particle.connect();
-          waitUntil(Particle.connected);
+                Serial.println("Publish results to cloud");
+                Particle.connect();
+                waitUntil(Particle.connected);
 
-          sprintf(publishString,"{\"cm\": %lu, \"wifi\": %d, \"v\": %.2f, \"soc\": %.2f, \"alert\": %d, \"fp\": %d}",
-            current, WiFi.RSSI(), lipo.getVoltage(), lipo.getSOC(), lipo.getAlert(), force ? 1 : 0);
-          Serial.println(publishString);
-          Particle.publish("water-sensor", publishString, PRIVATE);
-          Particle.process();
-          delay(1000);
+                sprintf(publishString,"{\"cm\": %lu, \"wifi\": %d, \"v\": %.2f, \"soc\": %.2f, \"alert\": %d, \"fp\": %d}",
+                        current, WiFi.RSSI(), lipo.getVoltage(), lipo.getSOC(), lipo.getAlert(), force ? 1 : 0);
+                Serial.println(publishString);
+                Particle.publish("water-sensor", publishString, PRIVATE);
+                Particle.process();
+                delay(1000);
 
-          timeSync();
+                timeSync();
         }
 
         if (mode == 2) {
-          WiFi.off();
-          delay(sleepTime() * 1000);
+                WiFi.off();
+                delay(sleepTime() * 1000);
         } else {
-          lipo.sleep();
-          System.sleep(SLEEP_MODE_DEEP,sleepTime());
+                lipo.sleep();
+                System.sleep(SLEEP_MODE_DEEP,sleepTime());
         }
 }
 
@@ -122,64 +122,66 @@ void ping(pin_t trig_pin, pin_t echo_pin, uint32_t wait, int i) {
 
 // find the highest value in the measurement array
 unsigned int arrayMax(unsigned int *arrayPtr, unsigned int size) {
-  unsigned int max = arrayPtr[0];
-  for(int i = 0; i < size; i++) {
-    if(max < arrayPtr[i]) {
-      max = arrayPtr[i];
-    }
-  }
-  return max;
+        unsigned int max = arrayPtr[0];
+        for(int i = 0; i < size; i++) {
+                if(max < arrayPtr[i]) {
+                        max = arrayPtr[i];
+                }
+        }
+        return max;
 }
 
 // find the lowest value in the measurement array
 unsigned int arrayMin(unsigned int *arrayPtr, unsigned int size) {
-  unsigned int min = arrayPtr[0];
-  for(int i = 0; i < size; i++) {
-    if(min > arrayPtr[i]) {
-      min = arrayPtr[i];
-    }
-  }
-  return min;
+        unsigned int min = arrayPtr[0];
+        for(int i = 0; i < size; i++) {
+                if(min > arrayPtr[i]) {
+                        min = arrayPtr[i];
+                }
+        }
+        return min;
 }
 
 // shift array of historic distance values and add new one
 void shiftLastDistances(unsigned int newDistance) {
-  for(int i = MEASUREMENTS - 1; i > 0; i--) {
-    lastDistances[i] = lastDistances[i - 1];
-  }
-  lastDistances[0] = newDistance;
+        for(int i = MEASUREMENTS - 1; i > 0; i--) {
+                lastDistances[i] = lastDistances[i - 1];
+        }
+        lastDistances[0] = newDistance;
 }
 
 // sync RTC time with cloud
 void timeSync() {
-  time_t now = Time.now();
-  time_t lastInterval = now - (now % TIMESYNC_INTERVAL);
-  if (now - lastInterval < 10) {
-      Serial.println("force time sync");
-      Particle.syncTime();
-      Particle.publish("water-sensor-time", "done");
-      Serial.println("time sync done");
-      delay(2000);
-  }
+        time_t now = Time.now();
+        time_t lastInterval = now - (now % TIMESYNC_INTERVAL);
+        if (now - lastInterval < 10) {
+                Serial.println("force time sync");
+                Particle.syncTime();
+                for(int i = 0; i < 10; i++) {
+                        Particle.process();
+                        delay(500);
+                }
+                Particle.publish("sensor-time", "time sync done");
+        }
 }
 
 // calc sleep time till next measurement
 int sleepTime() {
-  time_t now = Time.now();
-  time_t nextInterval = now - (now % MEASUREMENT_INTERVAL) + MEASUREMENT_INTERVAL;
-  Serial.printf("now %s", asctime(gmtime(&now)));
-  Serial.printf("next measurement %s", asctime(gmtime(&nextInterval)));
-  delay(10); // needed to give serial time to print before going into sleep
-  return nextInterval - now;
+        time_t now = Time.now();
+        time_t nextInterval = now - (now % MEASUREMENT_INTERVAL) + MEASUREMENT_INTERVAL;
+        Serial.printf("now %s", asctime(gmtime(&now)));
+        Serial.printf("next measurement %s", asctime(gmtime(&nextInterval)));
+        delay(10); // needed to give serial time to print before going into sleep
+        return nextInterval - now;
 }
 
 // calc if a force publish is needed to send updates on defined intervals
 bool forcePublish() {
-  time_t now = Time.now();
-  time_t lastInterval = now - (now % MEASUREMENT_INTERVAL);
-  if (lastInterval % (PUBLISH_INTERVAL) == 0) {
-      Serial.println("force publish");
-      return true;
-  }
-  return false;
+        time_t now = Time.now();
+        time_t lastInterval = now - (now % MEASUREMENT_INTERVAL);
+        if (lastInterval % (PUBLISH_INTERVAL) == 0) {
+                Serial.println("force publish");
+                return true;
+        }
+        return false;
 }
