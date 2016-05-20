@@ -26,16 +26,18 @@ retained unsigned int lastDistances[MEASUREMENTS]; // last n distance values sto
 // publish buffers
 struct Measurement {
   unsigned int distance;
-  time_t timestamp;
+  time_t       timestamp;
 };
 const unsigned int PUBLISH_BUFFER_SIZE     = 24;
 retained unsigned int publish_buffer_count = 0;
 retained Measurement  publish_buffer[PUBLISH_BUFFER_SIZE];
 
 // measurement and publish interval
-const unsigned int MEASUREMENT_INTERVAL = 60 * 15;      // 15 minutes for normal readings
-const unsigned int PUBLISH_INTERVAL     = 4 * 60 * 60;  // 1 hour as regular publish interval
-const unsigned int TIMESYNC_INTERVAL    = 24 * 60 * 60; // 1 day to update cloud time
+const unsigned int MEASUREMENT_INTERVAL       = 60 * 15;      // 15 minutes for normal readings
+const unsigned int MEASUREMENT_INTERVAL_SHORT = 60 * 5;       // 5 minutes for readings if values changing
+const unsigned int SAVE_INTERVAL              = 60 * 60;      // 1 hour for normal readings
+const unsigned int PUBLISH_INTERVAL           = 4 * 60 * 60;  // 4 hour as regular publish interval
+const unsigned int TIMESYNC_INTERVAL          = 24 * 60 * 60; // 1 day to update cloud time
 
 // particle.io publush helper
 char publishString[128];
@@ -171,7 +173,7 @@ void loop() {
 
   // step 5: repare sleep
   lipo.sleep();
-  System.sleep(SLEEP_MODE_DEEP, sleepTime());
+  System.sleep(SLEEP_MODE_DEEP, sleepTime(inRange));
 }
 
 void ping(pin_t trig_pin, pin_t echo_pin, int i) {
@@ -254,7 +256,7 @@ bool calcRegularMeasurement() {
   time_t now          = Time.now();
   time_t lastInterval = now - (now % 60);
 
-  if (lastInterval % (MEASUREMENT_INTERVAL) == 0) {
+  if (lastInterval % (SAVE_INTERVAL) == 0) {
     Serial.println("Yes!");
     return true;
   }
@@ -277,15 +279,18 @@ bool calcRegularPublish() {
 }
 
 // calc sleep time till next measurement
-int sleepTime() {
-  time_t now             = Time.now();
-  time_t nextMeasurement = now - (now % MEASUREMENT_INTERVAL) +
-                           MEASUREMENT_INTERVAL;
-  time_t nextPublish = now - (now % PUBLISH_INTERVAL) + PUBLISH_INTERVAL;
+int sleepTime(bool regular) {
+  time_t now            = Time.now();
+  unsigned int interval =
+    regular ? MEASUREMENT_INTERVAL : MEASUREMENT_INTERVAL_SHORT;
+  time_t nextMeasurement = now - (now % interval) + interval;
+  time_t nextSave        = now - (now % SAVE_INTERVAL) + SAVE_INTERVAL;
+  time_t nextPublish     = now - (now % PUBLISH_INTERVAL) + PUBLISH_INTERVAL;
 
-  Serial.printf("Now %s",              asctime(gmtime(&now)));
-  Serial.printf("Next measurement %s", asctime(gmtime(&nextMeasurement)));
-  Serial.printf("Next publish %s",     asctime(gmtime(&nextPublish)));
+  Serial.printf("Now %s",               asctime(gmtime(&now)));
+  Serial.printf("Next measurement %s",  asctime(gmtime(&nextMeasurement)));
+  Serial.printf("Next regular save %s", asctime(gmtime(&nextSave)));
+  Serial.printf("Next publish %s",      asctime(gmtime(&nextPublish)));
   delay(10); // needed to give serial time to print before going into sleep
   return nextMeasurement - now;
 }
