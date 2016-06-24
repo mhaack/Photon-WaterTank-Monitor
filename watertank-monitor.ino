@@ -26,6 +26,7 @@ retained unsigned int lastDistances[MEASUREMENTS]; // last n distance values sto
 // publish buffers
 struct Measurement {
   unsigned int distance;
+  bool         regular;
   time_t       timestamp;
 };
 const unsigned int PUBLISH_BUFFER_SIZE     = 24;
@@ -44,7 +45,7 @@ char publishString[128];
 
 void setup() {
   Serial.begin(115200);
-  Serial.println("Water Tank Monitor");
+  Serial.println("[System] Water Tank Monitor");
 
   // Set up power for HC-SR04 sensor
   pinMode(powerControl, OUTPUT);
@@ -60,7 +61,7 @@ void setup() {
   time_t now = Time.now();
 
   if (now < 1451606460) { // if time is before Fri, 01 Jan 2016 00:01:00 GMT
-    Serial.println("Initial time sync ...");
+    Serial.println("[System] Initial time sync ...");
     Particle.connect();
     waitUntil(Particle.connected);
     timeSync();
@@ -69,32 +70,29 @@ void setup() {
 
 void loop() {
   // step 1: measurement
-  Serial.println("Measurement ...");
+  Serial.println("[Sensor] Measurement ...");
   powerState = !powerState;
-  Serial.printlnf("Sensor power: %s", powerState ? "on" : "off");
+  Serial.printlnf("[Sensor] Power: %s", powerState ? "on" : "off");
   digitalWrite(powerControl, powerState);
   delay(250);
 
   for (int i = 0; i < MEASUREMENTS; i++) {
     ping(sensorTrigger, sensorEcho, i);
     delay(100);
-    Serial.printlnf("Measurement %d: %lu", i, distance[i]);
+    Serial.printlnf("[Sensor] Measurement %d: %lu", i, distance[i]);
   }
   powerState = !powerState;
-  Serial.printlnf("Sensor power: %s", powerState ? "on" : "off");
+  Serial.printlnf("[Sensor] Power: %s", powerState ? "on" : "off");
   digitalWrite(powerControl, powerState);
-  Serial.println("Measurement done");
+  Serial.println("[Sensor] Measurement done");
 
   // step 2: compare current measurement with historic values
   unsigned int current = arrayMax(distance, MEASUREMENTS);
   unsigned int lastMax = arrayMax(lastDistances, MEASUREMENTS);
   unsigned int lastMin = arrayMin(lastDistances, MEASUREMENTS);
   bool inRange         = current >= lastMin && current <= lastMax;
-  Serial.printlnf("Current: %lu, LMin: %lu, LMax: %lu, inRange: %s",
-                  current,
-                  lastMin,
-                  lastMax,
-                  inRange ? "Yes" : "No");
+  Serial.printlnf("[Sensor] Current: %lu, LMin: %lu, LMax: %lu, inRange: %s",
+                  current, lastMin, lastMax, inRange ? "Yes" : "No");
 
   // put current value into distantce history store
   shiftLastDistances(lastDistances, MEASUREMENTS, current);
@@ -103,18 +101,19 @@ void loop() {
   bool regularMeasurement = calcRegularMeasurement();
 
   if (regularMeasurement || !inRange) {
-    Serial.printlnf("Store measurement - regular: %s, inRange: %s",
-                    regularMeasurement ? "Yes" : "No",
-                    inRange ? "Yes" : "No");
-    shiftPublishBuffer(publish_buffer, PUBLISH_BUFFER_SIZE, current);
+    Serial.printlnf("[Buffer] Store measurement - regular: %s, inRange: %s",
+                    regularMeasurement ? "Yes" : "No", inRange ? "Yes" : "No");
+    shiftPublishBuffer(publish_buffer,
+                       PUBLISH_BUFFER_SIZE,
+                       current,
+                       regularMeasurement);
     publish_buffer_count++;
   }
 
   // step 4: publish data to particle.io cloud
   bool regularPublish = calcRegularPublish();
-  Serial.printlnf("Check for publish buffer size %lu of %lu",
-                  publish_buffer_count,
-                  PUBLISH_BUFFER_SIZE);
+  Serial.printlnf("[Cloud] Check for publish buffer size %lu of %lu",
+                  publish_buffer_count, PUBLISH_BUFFER_SIZE);
 
   if (regularPublish || (publish_buffer_count >= PUBLISH_BUFFER_SIZE)) {
     bool publishSuccess = false;
@@ -124,18 +123,17 @@ void loop() {
 
       if (waitFor(Particle.connected, 10000)) {
         Serial.printlnf(
-          "Publish measurement buffer - regular: %s, buffer size: %lu",
-          regularPublish ? "Yes" : "No",
-          publish_buffer_count);
+          "[Cloud] Send measurement buffer - regular: %s, buffer size: %lu",
+          regularPublish ? "Yes" : "No", publish_buffer_count);
 
         // publish buffer data
         for (int i = 0; i < publish_buffer_count; i++) {
           sprintf(publishString,
-                  "{\"cm\": %lu, \"createdAt\": %lu000, \"fp\": %d}",
+                  "{\"cm\": %lu, \"regular\": %d, \"createdAt\": %lu000}",
                   publish_buffer[i].distance,
-                  publish_buffer[i].timestamp,
-                  regularPublish ? 1 : 0);
-          Serial.printlnf("Publish measurement %d: %s", i, publishString);
+                  publish_buffer[i].regular ? 1 : 0,
+                  publish_buffer[i].timestamp);
+          Serial.printlnf("[Cloud] Send measurement %d: %s", i, publishString);
           Particle.publish("water-sensor", publishString, PRIVATE);
           delay(1000);
         }
@@ -147,24 +145,22 @@ void loop() {
         // publish some system condition data
         sprintf(publishString,
                 "{\"wifi\": %d, \"v\": %.2f, \"soc\": %.2f, \"alert\": %d}",
-                WiFi.RSSI(),
-                lipo.getVoltage(),
-                lipo.getSOC(),
-                lipo.getAlert());
+                WiFi.RSSI(), lipo.getVoltage(), lipo.getSOC(), lipo.getAlert());
         publishSuccess = Particle.publish("tech-water-sensor",
                                           publishString,
                                           PRIVATE);
-        Serial.println("Publish successfull.");
+        Serial.printlnf("[Cloud] Successfull: %s", publishSuccess ? "Yes" : "No");
+        timeSync();
       } else {
-        Serial.println("Publish failed, connect timeout.");
+        Serial.println("[Cloud] Failed, connect timeout.");
 
         // if the buffer still has some space left we can go ahead and try
         // later, otherwise we retry now
         if (publish_buffer_count < PUBLISH_BUFFER_SIZE) {
-          Serial.println("Publish buffer is not full retry later.");
+          Serial.println("[Cloud] buffer is not full retry later.");
           publishSuccess = true;
         } else {
-          Serial.println("Publish buffer is full retry now.");
+          Serial.println("[Cloud] buffer is full retry now.");
           delay(5000);
         }
       }
@@ -241,18 +237,19 @@ void shiftLastDistances(unsigned int *arrayPtr,
 
 // shift publish buffer array and add new value
 void shiftPublishBuffer(struct Measurement *arrayPtr,
-                        unsigned int        size,
-                        unsigned int        newValue) {
+                        unsigned int size,
+                        unsigned int value, bool regular) {
   for (int i = size - 1; i > 0; i--) {
     arrayPtr[i] = arrayPtr[i - 1];
   }
-  arrayPtr[0].distance  = newValue;
+  arrayPtr[0].distance  = value;
+  arrayPtr[0].regular   = regular;
   arrayPtr[0].timestamp = Time.now();
 }
 
 // calc if a force publish is needed to send updates on defined intervals
 bool calcRegularMeasurement() {
-  Serial.print("Check for regular measurement... ");
+  Serial.print("[Sensor] Check for regular measurement... ");
   time_t now          = Time.now();
   time_t lastInterval = now - (now % 60);
 
@@ -266,7 +263,7 @@ bool calcRegularMeasurement() {
 
 // calc if a force publish is needed to send updates on defined intervals
 bool calcRegularPublish() {
-  Serial.print("Check for regular publish... ");
+  Serial.print("[Cloud] Check for regular publish... ");
   time_t now          = Time.now();
   time_t lastInterval = now - (now % 60);
 
@@ -287,10 +284,11 @@ int sleepTime(bool regular) {
   time_t nextSave        = now - (now % SAVE_INTERVAL) + SAVE_INTERVAL;
   time_t nextPublish     = now - (now % PUBLISH_INTERVAL) + PUBLISH_INTERVAL;
 
-  Serial.printf("Now %s",               asctime(gmtime(&now)));
-  Serial.printf("Next measurement %s",  asctime(gmtime(&nextMeasurement)));
-  Serial.printf("Next regular save %s", asctime(gmtime(&nextSave)));
-  Serial.printf("Next publish %s",      asctime(gmtime(&nextPublish)));
+  Serial.printf("[System] Now %s", asctime(gmtime(&now)));
+  Serial.printf("[System] Next measurement %s",
+                asctime(gmtime(&nextMeasurement)));
+  Serial.printf("[System] Next regular save %s", asctime(gmtime(&nextSave)));
+  Serial.printf("[System] Next publish %s",      asctime(gmtime(&nextPublish)));
   delay(10); // needed to give serial time to print before going into sleep
   return nextMeasurement - now;
 }
@@ -301,7 +299,7 @@ void timeSync() {
   time_t lastInterval = now - (now % TIMESYNC_INTERVAL);
 
   if ((now - lastInterval < 10) || (now < 1451606460)) {
-    Serial.println("Force time sync");
+    Serial.println("[System] Force time sync");
     Particle.syncTime();
 
     for (int i = 0; i < 10; i++) {
@@ -309,7 +307,8 @@ void timeSync() {
       delay(500);
     }
     now = Time.now();
-    Serial.printlnf("Force time sync done - time is %s", asctime(gmtime(&now)));
+    Serial.printlnf("[System] Force time sync done - time is %s",
+                    asctime(gmtime(&now)));
     Particle.publish("sensor-time", "time sync done");
   }
 }
