@@ -29,7 +29,7 @@ struct Measurement {
   bool         regular;
   time_t       timestamp;
 };
-const unsigned int PUBLISH_BUFFER_SIZE     = 24;
+const unsigned int PUBLISH_BUFFER_SIZE     = 48;
 retained unsigned int publish_buffer_count = 0;
 retained Measurement  publish_buffer[PUBLISH_BUFFER_SIZE];
 
@@ -45,7 +45,9 @@ char publishString[128];
 
 void setup() {
   Serial.begin(115200);
+  delay(1000);
   Serial.println("[System] Water Tank Monitor");
+  Serial.printlnf("[System] Firmware version: %s", System.version().c_str());
 
   // Set up power for HC-SR04 sensor
   pinMode(powerControl, OUTPUT);
@@ -116,53 +118,46 @@ void loop() {
                   publish_buffer_count, PUBLISH_BUFFER_SIZE);
 
   if (regularPublish || (publish_buffer_count >= PUBLISH_BUFFER_SIZE)) {
-    bool publishSuccess = false;
+    Particle.connect();
 
-    while (!publishSuccess) {
-      Particle.connect();
+    if (waitFor(Particle.connected, 15000)) {
+      Serial.printlnf(
+        "[Cloud] Send measurement buffer - regular: %s, buffer size: %lu",
+        regularPublish ? "Yes" : "No", publish_buffer_count);
 
-      if (waitFor(Particle.connected, 10000)) {
-        Serial.printlnf(
-          "[Cloud] Send measurement buffer - regular: %s, buffer size: %lu",
-          regularPublish ? "Yes" : "No", publish_buffer_count);
-
-        // publish buffer data
-        for (int i = 0; i < publish_buffer_count; i++) {
-          sprintf(publishString,
-                  "{\"cm\": %lu, \"regular\": %d, \"createdAt\": %lu000}",
-                  publish_buffer[i].distance,
-                  publish_buffer[i].regular ? 1 : 0,
-                  publish_buffer[i].timestamp);
-          Serial.printlnf("[Cloud] Send measurement %d: %s", i, publishString);
-          Particle.publish("water-sensor", publishString, PRIVATE);
-          delay(1000);
-        }
-
-        // empty publish buffer
-        memset(publish_buffer, 0, sizeof(publish_buffer));
-        publish_buffer_count = 0;
-
-        // publish some system condition data
+      // publish buffer data
+      for (int i = 0; i < publish_buffer_count; i++) {
         sprintf(publishString,
-                "{\"wifi\": %d, \"v\": %.2f, \"soc\": %.2f, \"alert\": %d}",
-                WiFi.RSSI(), lipo.getVoltage(), lipo.getSOC(), lipo.getAlert());
-        publishSuccess = Particle.publish("tech-water-sensor",
-                                          publishString,
-                                          PRIVATE);
-        Serial.printlnf("[Cloud] Successfull: %s", publishSuccess ? "Yes" : "No");
-        timeSync();
-      } else {
-        Serial.println("[Cloud] Failed, connect timeout.");
+                "{\"cm\": %u, \"regular\": %d, \"createdAt\": %lu000}",
+                publish_buffer[i].distance,
+                publish_buffer[i].regular ? 1 : 0,
+                publish_buffer[i].timestamp);
+        Serial.printlnf("[Cloud] Send measurement %d: %s", i, publishString);
+        Particle.publish("water-sensor", publishString, PRIVATE);
+        delay(1000);
+      }
 
-        // if the buffer still has some space left we can go ahead and try
-        // later, otherwise we retry now
-        if (publish_buffer_count < PUBLISH_BUFFER_SIZE) {
-          Serial.println("[Cloud] buffer is not full retry later.");
-          publishSuccess = true;
-        } else {
-          Serial.println("[Cloud] buffer is full retry now.");
-          delay(5000);
-        }
+      // empty publish buffer
+      memset(publish_buffer, 0, sizeof(publish_buffer));
+      publish_buffer_count = 0;
+
+      // publish some system condition data
+      sprintf(publishString,
+              "{\"wifi\": %d, \"v\": %.2f, \"soc\": %.2f, \"alert\": %d}",
+              WiFi.RSSI(), lipo.getVoltage(), lipo.getSOC(), lipo.getAlert());
+      boolean publishSuccess = Particle.publish("tech-water-sensor",
+                                                publishString,
+                                                PRIVATE);
+      Serial.printlnf("[Cloud] Successfull: %s", publishSuccess ? "Yes" : "No");
+      timeSync();
+    } else {
+      Serial.println("[Cloud] Failed, connect timeout.");
+
+      // if the buffer still has some space left we can go ahead and try
+      // later
+      if (publish_buffer_count >= PUBLISH_BUFFER_SIZE) {
+        Serial.println(
+          "[Cloud] buffer is full retry. Will lose old measurements now");
       }
     }
   }
