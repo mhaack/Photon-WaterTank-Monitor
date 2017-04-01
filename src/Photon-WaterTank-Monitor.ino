@@ -2,7 +2,7 @@
 
 // Water Tank Monitor
 //
-// Version: 1.1
+// Version: 1.2
 // Author: Markus Haack (http://github.com/mhaack)
 // -----------------------------------------
 
@@ -34,20 +34,129 @@ retained unsigned int publish_buffer_count = 0;
 retained Measurement  publish_buffer[PUBLISH_BUFFER_SIZE];
 
 // measurement and publish interval
-const unsigned int MEASUREMENT_INTERVAL       = 60 * 15;      // 15 minutes for normal readings
+const unsigned int MEASUREMENT_INTERVAL       = 60 * 60;      // 1 hour for normal readings
 const unsigned int MEASUREMENT_INTERVAL_SHORT = 60 * 5;       // 5 minutes for readings if values changing
-const unsigned int SAVE_INTERVAL              = 60 * 60;      // 1 hour for normal readings
 const unsigned int PUBLISH_INTERVAL           = 4 * 60 * 60;  // 4 hour as regular publish interval
 const unsigned int TIMESYNC_INTERVAL          = 24 * 60 * 60; // 1 day to update cloud time
+
+SerialLogHandler logHandler;
 
 // particle.io publush helper
 char publishString[128];
 
+// shift publish buffer array and add new value
+void shiftPublishBuffer(struct Measurement *arrayPtr,
+                        unsigned int size,
+                        unsigned int value, bool regular) {
+  for (int i = size - 1; i > 0; i--) {
+    arrayPtr[i] = arrayPtr[i - 1];
+  }
+  arrayPtr[0].distance  = value;
+  arrayPtr[0].regular   = regular;
+  arrayPtr[0].timestamp = Time.now();
+}
+
+// find the highest value in the measurement array
+unsigned int arrayMax(unsigned int *arrayPtr, unsigned int size) {
+  unsigned int max = arrayPtr[0];
+
+  for (unsigned int i = 0; i < size; i++) {
+    if (max < arrayPtr[i]) {
+      max = arrayPtr[i];
+    }
+  }
+  return max;
+}
+
+// find the lowest value in the measurement array
+unsigned int arrayMin(unsigned int *arrayPtr, unsigned int size) {
+  unsigned int min = arrayPtr[0];
+
+  for (unsigned int i = 0; i < size; i++) {
+    if (min > arrayPtr[i]) {
+      min = arrayPtr[i];
+    }
+  }
+  return min;
+}
+
+// shift array of historic distance values and add new one
+void shiftLastDistances(unsigned int *arrayPtr,
+                        unsigned int  size,
+                        unsigned int  newValue) {
+  for (int i = size - 1; i > 0; i--) {
+    arrayPtr[i] = arrayPtr[i - 1];
+  }
+  arrayPtr[0] = newValue;
+}
+
+// calc if a force publish is needed to send updates on defined intervals
+bool calcRegularMeasurement() {
+  time_t now          = Time.now();
+  time_t lastInterval = now - (now % 60);
+
+  boolean regularMeasurement = false;
+  if (lastInterval % (MEASUREMENT_INTERVAL) == 0) {
+    regularMeasurement = true;
+  }
+  Log.info("[Sensor] Check for regular measurement: %s", regularMeasurement ? "Yes" : "No");
+  return regularMeasurement;
+}
+
+// calc if a force publish is needed to send updates on defined intervals
+bool calcRegularPublish() {
+  time_t now          = Time.now();
+  time_t lastInterval = now - (now % 60);
+
+  boolean regularPublish = false;
+  if (lastInterval % (PUBLISH_INTERVAL) == 0) {
+    regularPublish = true;
+  }
+  Log.info("[Cloud] Check for regular publish: %s", regularPublish ? "Yes" : "No");
+  return regularPublish;
+}
+
+// calc sleep time till next measurement
+int sleepTime(bool regular) {
+  time_t now            = Time.now();
+  unsigned int interval = regular ? MEASUREMENT_INTERVAL : MEASUREMENT_INTERVAL_SHORT;
+  time_t nextMeasurement = now - (now % interval) + interval;
+  time_t nextSave        = now - (now % MEASUREMENT_INTERVAL) + MEASUREMENT_INTERVAL;
+  time_t nextPublish     = now - (now % PUBLISH_INTERVAL) + PUBLISH_INTERVAL;
+
+  Log.info("[System] Now %s", asctime(gmtime(&now)));
+  Log.info("[System] Next measurement %s", asctime(gmtime(&nextMeasurement)));
+  Log.info("[System] Next regular save %s", asctime(gmtime(&nextSave)));
+  Log.info("[System] Next publish %s",      asctime(gmtime(&nextPublish)));
+  delay(10); // needed to give serial time to print before going into sleep
+  return nextMeasurement - now;
+}
+
+// sync RTC time with cloud
+void timeSync() {
+  time_t now          = Time.now();
+  time_t lastInterval = now - (now % TIMESYNC_INTERVAL);
+
+  if ((now - lastInterval < 10) || (now < 1451606460)) {
+    Log.info("[System] Force time sync");
+    Particle.syncTime();
+
+    for (int i = 0; i < 10; i++) {
+      Particle.process();
+      delay(500);
+    }
+    now = Time.now();
+    Log.info("[System] Force time sync done - time is %s", asctime(gmtime(&now)));
+    Particle.publish("sensor-time", "time sync done");
+  }
+}
+
+// the setup
 void setup() {
   Serial.begin(115200);
-  delay(1000);
-  Serial.println("[System] Water Tank Monitor");
-  Serial.printlnf("[System] Firmware version: %s", System.version().c_str());
+  delay(5000);
+  Log.info("Water Tank Monitor");
+  Log.info("[System] Version: %s", (const char*)System.version());
 
   // Set up power for HC-SR04 sensor
   pinMode(powerControl, OUTPUT);
@@ -63,37 +172,36 @@ void setup() {
   time_t now = Time.now();
 
   if (now < 1451606460) { // if time is before Fri, 01 Jan 2016 00:01:00 GMT
-    Serial.println("[System] Initial time sync ...");
+    Log.info("[Cloud] Initial time sync ...");
     Particle.connect();
     waitUntil(Particle.connected);
     timeSync();
   }
 }
 
+// the main loop
 void loop() {
   // step 1: measurement
-  Serial.println("[Sensor] Measurement ...");
   powerState = !powerState;
-  Serial.printlnf("[Sensor] Power: %s", powerState ? "on" : "off");
+  Log.info("[Sensor] Start mesuarement, senor power: %s", powerState ? "on" : "off");
   digitalWrite(powerControl, powerState);
   delay(250);
 
-  for (int i = 0; i < MEASUREMENTS; i++) {
+  for (unsigned int i = 0; i < MEASUREMENTS; i++) {
     ping(sensorTrigger, sensorEcho, i);
     delay(100);
-    Serial.printlnf("[Sensor] Measurement %d: %lu", i, distance[i]);
+    Log.info("[Sensor] Measurement %d: %lu", i, distance[i]);
   }
   powerState = !powerState;
-  Serial.printlnf("[Sensor] Power: %s", powerState ? "on" : "off");
+  Log.info("[Sensor] Power: %s", powerState ? "on" : "off");
   digitalWrite(powerControl, powerState);
-  Serial.println("[Sensor] Measurement done");
 
   // step 2: compare current measurement with historic values
   unsigned int current = arrayMax(distance, MEASUREMENTS);
   unsigned int lastMax = arrayMax(lastDistances, MEASUREMENTS);
   unsigned int lastMin = arrayMin(lastDistances, MEASUREMENTS);
   bool inRange         = current >= lastMin && current <= lastMax;
-  Serial.printlnf("[Sensor] Current: %lu, LMin: %lu, LMax: %lu, inRange: %s",
+  Log.info("[Sensor] current: %lu, LMin: %lu, LMax: %lu, inRange: %s",
                   current, lastMin, lastMax, inRange ? "Yes" : "No");
 
   // put current value into distantce history store
@@ -103,36 +211,33 @@ void loop() {
   bool regularMeasurement = calcRegularMeasurement();
 
   if (regularMeasurement || !inRange) {
-    Serial.printlnf("[Buffer] Store measurement - regular: %s, inRange: %s",
-                    regularMeasurement ? "Yes" : "No", inRange ? "Yes" : "No");
-    shiftPublishBuffer(publish_buffer,
-                       PUBLISH_BUFFER_SIZE,
-                       current,
-                       regularMeasurement);
+    Log.info("[Memory] Store measurement - regular: %s, inRange: %s",
+        regularMeasurement ? "Yes" : "No", inRange ? "Yes" : "No");
+    shiftPublishBuffer(publish_buffer, PUBLISH_BUFFER_SIZE,
+                       current, regularMeasurement);
     publish_buffer_count++;
   }
 
   // step 4: publish data to particle.io cloud
   bool regularPublish = calcRegularPublish();
-  Serial.printlnf("[Cloud] Check for publish buffer size %lu of %lu",
+  Log.info("[Cloud] Check for publish buffer size %lu of %lu",
                   publish_buffer_count, PUBLISH_BUFFER_SIZE);
 
   if (regularPublish || (publish_buffer_count >= PUBLISH_BUFFER_SIZE)) {
     Particle.connect();
 
     if (waitFor(Particle.connected, 15000)) {
-      Serial.printlnf(
-        "[Cloud] Send measurement buffer - regular: %s, buffer size: %lu",
+      Log.info("[Cloud] Send measurement buffer - regular: %s, buffer size: %lu",
         regularPublish ? "Yes" : "No", publish_buffer_count);
 
       // publish buffer data
-      for (int i = 0; i < publish_buffer_count; i++) {
+      for (unsigned int i = 0; i < publish_buffer_count; i++) {
         sprintf(publishString,
                 "{\"cm\": %u, \"regular\": %d, \"createdAt\": %lu000}",
                 publish_buffer[i].distance,
                 publish_buffer[i].regular ? 1 : 0,
                 publish_buffer[i].timestamp);
-        Serial.printlnf("[Cloud] Send measurement %d: %s", i, publishString);
+        Log.info("[Cloud] Send measurement %d: %s", i, publishString);
         Particle.publish("water-sensor", publishString, PRIVATE);
         delay(1000);
       }
@@ -148,16 +253,15 @@ void loop() {
       boolean publishSuccess = Particle.publish("tech-water-sensor",
                                                 publishString,
                                                 PRIVATE);
-      Serial.printlnf("[Cloud] Successfull: %s", publishSuccess ? "Yes" : "No");
+      Log.info("[Cloud] Successfull: %s", publishSuccess ? "Yes" : "No");
       timeSync();
     } else {
-      Serial.println("[Cloud] Failed, connect timeout.");
+      Log.error("[Cloud] Failed, connect timeout.");
 
       // if the buffer still has some space left we can go ahead and try
       // later
       if (publish_buffer_count >= PUBLISH_BUFFER_SIZE) {
-        Serial.println(
-          "[Cloud] buffer is full retry. Will lose old measurements now");
+        Log.info("[Cloud] buffer is full retry. Will lose old measurements now");
       }
     }
   }
@@ -194,116 +298,4 @@ void ping(pin_t trig_pin, pin_t echo_pin, int i) {
   distance[i] = cm;
 
   delay(100);
-}
-
-// find the highest value in the measurement array
-unsigned int arrayMax(unsigned int *arrayPtr, unsigned int size) {
-  unsigned int max = arrayPtr[0];
-
-  for (int i = 0; i < size; i++) {
-    if (max < arrayPtr[i]) {
-      max = arrayPtr[i];
-    }
-  }
-  return max;
-}
-
-// find the lowest value in the measurement array
-unsigned int arrayMin(unsigned int *arrayPtr, unsigned int size) {
-  unsigned int min = arrayPtr[0];
-
-  for (int i = 0; i < size; i++) {
-    if (min > arrayPtr[i]) {
-      min = arrayPtr[i];
-    }
-  }
-  return min;
-}
-
-// shift array of historic distance values and add new one
-void shiftLastDistances(unsigned int *arrayPtr,
-                        unsigned int  size,
-                        unsigned int  newValue) {
-  for (int i = size - 1; i > 0; i--) {
-    arrayPtr[i] = arrayPtr[i - 1];
-  }
-  arrayPtr[0] = newValue;
-}
-
-// shift publish buffer array and add new value
-void shiftPublishBuffer(struct Measurement *arrayPtr,
-                        unsigned int size,
-                        unsigned int value, bool regular) {
-  for (int i = size - 1; i > 0; i--) {
-    arrayPtr[i] = arrayPtr[i - 1];
-  }
-  arrayPtr[0].distance  = value;
-  arrayPtr[0].regular   = regular;
-  arrayPtr[0].timestamp = Time.now();
-}
-
-// calc if a force publish is needed to send updates on defined intervals
-bool calcRegularMeasurement() {
-  Serial.print("[Sensor] Check for regular measurement... ");
-  time_t now          = Time.now();
-  time_t lastInterval = now - (now % 60);
-
-  if (lastInterval % (SAVE_INTERVAL) == 0) {
-    Serial.println("Yes!");
-    return true;
-  }
-  Serial.println("No");
-  return false;
-}
-
-// calc if a force publish is needed to send updates on defined intervals
-bool calcRegularPublish() {
-  Serial.print("[Cloud] Check for regular publish... ");
-  time_t now          = Time.now();
-  time_t lastInterval = now - (now % 60);
-
-  if (lastInterval % (PUBLISH_INTERVAL) == 0) {
-    Serial.println("Yes!");
-    return true;
-  }
-  Serial.println("No");
-  return false;
-}
-
-// calc sleep time till next measurement
-int sleepTime(bool regular) {
-  time_t now            = Time.now();
-  unsigned int interval =
-    regular ? MEASUREMENT_INTERVAL : MEASUREMENT_INTERVAL_SHORT;
-  time_t nextMeasurement = now - (now % interval) + interval;
-  time_t nextSave        = now - (now % SAVE_INTERVAL) + SAVE_INTERVAL;
-  time_t nextPublish     = now - (now % PUBLISH_INTERVAL) + PUBLISH_INTERVAL;
-
-  Serial.printf("[System] Now %s", asctime(gmtime(&now)));
-  Serial.printf("[System] Next measurement %s",
-                asctime(gmtime(&nextMeasurement)));
-  Serial.printf("[System] Next regular save %s", asctime(gmtime(&nextSave)));
-  Serial.printf("[System] Next publish %s",      asctime(gmtime(&nextPublish)));
-  delay(10); // needed to give serial time to print before going into sleep
-  return nextMeasurement - now;
-}
-
-// sync RTC time with cloud
-void timeSync() {
-  time_t now          = Time.now();
-  time_t lastInterval = now - (now % TIMESYNC_INTERVAL);
-
-  if ((now - lastInterval < 10) || (now < 1451606460)) {
-    Serial.println("[System] Force time sync");
-    Particle.syncTime();
-
-    for (int i = 0; i < 10; i++) {
-      Particle.process();
-      delay(500);
-    }
-    now = Time.now();
-    Serial.printlnf("[System] Force time sync done - time is %s",
-                    asctime(gmtime(&now)));
-    Particle.publish("sensor-time", "time sync done");
-  }
 }
