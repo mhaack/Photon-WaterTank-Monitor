@@ -37,7 +37,6 @@ retained Measurement  publish_buffer[PUBLISH_BUFFER_SIZE];
 const unsigned int MEASUREMENT_INTERVAL       = 60 * 60;      // 1 hour for normal readings
 const unsigned int MEASUREMENT_INTERVAL_SHORT = 60 * 5;       // 5 minutes for readings if values changing
 const unsigned int PUBLISH_INTERVAL           = 4 * 60 * 60;  // 4 hour as regular publish interval
-const unsigned int TIMESYNC_INTERVAL          = 24 * 60 * 60; // 1 day to update cloud time
 
 SerialLogHandler logHandler;
 
@@ -132,25 +131,6 @@ int sleepTime(bool regular) {
   return nextMeasurement - now;
 }
 
-// sync RTC time with cloud
-void timeSync() {
-  time_t now          = Time.now();
-  time_t lastInterval = now - (now % TIMESYNC_INTERVAL);
-
-  if ((now - lastInterval < 10) || (now < 1451606460)) {
-    Log.info("[System] Force time sync");
-    Particle.syncTime();
-
-    for (int i = 0; i < 10; i++) {
-      Particle.process();
-      delay(500);
-    }
-    now = Time.now();
-    Log.info("[System] Force time sync done - time is %s", asctime(gmtime(&now)));
-    Particle.publish("sensor-time", "time sync done");
-  }
-}
-
 // the setup
 void setup() {
   Serial.begin(115200);
@@ -167,15 +147,16 @@ void setup() {
   lipo.wake();
   lipo.quickStart();
   lipo.setThreshold(10);
+  Log.info("[System] Battery: %.2f V, %.1f %%", lipo.getVoltage(), lipo.getSOC());
 
-  // inital time sync if RTC is not initalized
-  time_t now = Time.now();
-
-  if (now < 1451606460) { // if time is before Fri, 01 Jan 2016 00:01:00 GMT
-    Log.info("[Cloud] Initial time sync ...");
-    Particle.connect();
+  // inital time sync if real time is not initalized
+  if (!Time.isValid()) {
+    Log.info("[System] Time sync ...");
     waitUntil(Particle.connected);
-    timeSync();
+    waitFor(Time.isValid, 60000);
+    Log.info("[System] Time sync done");
+  } else {
+    Log.info("[System] Time is valid");
   }
 }
 
@@ -193,8 +174,8 @@ void loop() {
     Log.info("[Sensor] Measurement %d: %lu", i, distance[i]);
   }
   powerState = !powerState;
-  Log.info("[Sensor] Power: %s", powerState ? "on" : "off");
   digitalWrite(powerControl, powerState);
+  Log.info("[Sensor] Mesuarement done, sensor power: %s", powerState ? "on" : "off");
 
   // step 2: compare current measurement with historic values
   unsigned int current = arrayMax(distance, MEASUREMENTS);
@@ -226,7 +207,7 @@ void loop() {
   if (regularPublish || (publish_buffer_count >= PUBLISH_BUFFER_SIZE)) {
     Particle.connect();
 
-    if (waitFor(Particle.connected, 15000)) {
+    if (waitFor(Particle.connected, 30000)) {
       Log.info("[Cloud] Send measurement buffer - regular: %s, buffer size: %lu",
         regularPublish ? "Yes" : "No", publish_buffer_count);
 
@@ -250,19 +231,14 @@ void loop() {
       sprintf(publishString,
               "{\"wifi\": %d, \"v\": %.2f, \"soc\": %.2f, \"alert\": %d}",
               WiFi.RSSI(), lipo.getVoltage(), lipo.getSOC(), lipo.getAlert());
-      boolean publishSuccess = Particle.publish("tech-water-sensor",
-                                                publishString,
-                                                PRIVATE);
+      boolean publishSuccess = Particle.publish("tech-water-sensor", publishString, PRIVATE);
       Log.info("[Cloud] Successfull: %s", publishSuccess ? "Yes" : "No");
-      timeSync();
     } else {
-      Log.error("[Cloud] Failed, connect timeout.");
-
-      // if the buffer still has some space left we can go ahead and try
-      // later
-      if (publish_buffer_count >= PUBLISH_BUFFER_SIZE) {
-        Log.info("[Cloud] buffer is full retry. Will lose old measurements now");
-      }
+        // if the buffer still has some space left we can go ahead and try later
+        Log.error("[Cloud] Failed, connect timeout.");
+        if (publish_buffer_count >= PUBLISH_BUFFER_SIZE) {
+            Log.info("[Cloud] buffer is full retry. Will lose old measurements now");
+        }
     }
   }
 
