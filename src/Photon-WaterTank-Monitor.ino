@@ -52,7 +52,7 @@ void shiftPublishBuffer(struct Measurement *arrayPtr,
   }
   arrayPtr[0].distance  = value;
   arrayPtr[0].regular   = regular;
-  arrayPtr[0].timestamp = Time.now();
+  arrayPtr[0].timestamp = Time.local();
 }
 
 // find the highest value in the measurement array
@@ -91,7 +91,7 @@ void shiftLastDistances(unsigned int *arrayPtr,
 
 // calc if a force publish is needed to send updates on defined intervals
 bool calcRegularMeasurement() {
-  time_t now          = Time.now();
+  time_t now          = Time.local();
   time_t lastInterval = now - (now % 60);
 
   boolean regularMeasurement = false;
@@ -104,7 +104,7 @@ bool calcRegularMeasurement() {
 
 // calc if a force publish is needed to send updates on defined intervals
 bool calcRegularPublish() {
-  time_t now          = Time.now();
+  time_t now          = Time.local();
   time_t lastInterval = now - (now % 60);
 
   boolean regularPublish = false;
@@ -117,16 +117,15 @@ bool calcRegularPublish() {
 
 // calc sleep time till next measurement
 int sleepTime(bool regular) {
-  time_t now            = Time.now();
+  time_t now            = Time.local();
   unsigned int interval = regular ? MEASUREMENT_INTERVAL : MEASUREMENT_INTERVAL_SHORT;
   time_t nextMeasurement = now - (now % interval) + interval;
   time_t nextSave        = now - (now % MEASUREMENT_INTERVAL) + MEASUREMENT_INTERVAL;
   time_t nextPublish     = now - (now % PUBLISH_INTERVAL) + PUBLISH_INTERVAL;
 
-  Log.info("[System] Now %s", asctime(gmtime(&now)));
-  Log.info("[System] Next measurement %s", asctime(gmtime(&nextMeasurement)));
-  Log.info("[System] Next regular save %s", asctime(gmtime(&nextSave)));
-  Log.info("[System] Next publish %s",      asctime(gmtime(&nextPublish)));
+  Log.info("[System] Next measurement %s", Time.format(nextMeasurement, TIME_FORMAT_ISO8601_FULL).c_str());
+  Log.info("[System] Next regular save %s", Time.format(nextSave, TIME_FORMAT_ISO8601_FULL).c_str());
+  Log.info("[System] Next publish %s", Time.format(nextPublish, TIME_FORMAT_ISO8601_FULL).c_str());
   delay(10); // needed to give serial time to print before going into sleep
   return nextMeasurement - now;
 }
@@ -150,6 +149,7 @@ void setup() {
   Log.info("[System] Battery: %.2f V, %.1f %%", lipo.getVoltage(), lipo.getSOC());
 
   // inital time sync if real time is not initalized
+  Time.zone(1);
   if (!Time.isValid()) {
     Log.info("[System] Time sync ...");
     waitUntil(Particle.connected);
@@ -158,6 +158,8 @@ void setup() {
   } else {
     Log.info("[System] Time is valid");
   }
+  Log.info("[System] Current time is: %s", Time.format(Time.local(), TIME_FORMAT_ISO8601_FULL).c_str());
+
 }
 
 // the main loop
