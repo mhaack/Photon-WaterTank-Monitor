@@ -7,6 +7,7 @@
 // -----------------------------------------
 
 #include "SparkFunMAX17043.h"
+#include "MQTT.h"
 
 SYSTEM_MODE(SEMI_AUTOMATIC);
 STARTUP(WiFi.selectAntenna(ANT_EXTERNAL));
@@ -37,6 +38,12 @@ retained Measurement  publish_buffer[PUBLISH_BUFFER_SIZE];
 const unsigned int MEASUREMENT_INTERVAL       = 60 * 60;      // 1 hour for normal readings
 const unsigned int MEASUREMENT_INTERVAL_SHORT = 60 * 5;       // 5 minutes for readings if values changing
 const unsigned int PUBLISH_INTERVAL           = 4 * 60 * 60;  // 4 hour as regular publish interval
+
+// MQTT
+void callback(char* topic, byte* payload, unsigned int length);
+byte mqttServer[] = { 192,168,1,20 };
+MQTT mqttClient(mqttServer, 1883, callback);
+const String sensorName = "watertank";
 
 SerialLogHandler logHandler;
 
@@ -152,6 +159,7 @@ void setup() {
   Time.zone(1);
   if (!Time.isValid()) {
     Log.info("[System] Time sync ...");
+    Particle.connect();
     waitUntil(Particle.connected);
     waitFor(Time.isValid, 60000);
     Log.info("[System] Time sync done");
@@ -207,34 +215,44 @@ void loop() {
                   publish_buffer_count, PUBLISH_BUFFER_SIZE);
 
   if (regularPublish || (publish_buffer_count >= PUBLISH_BUFFER_SIZE)) {
-    Particle.connect();
 
+    // particle cloud publish
+    Particle.connect();
     if (waitFor(Particle.connected, 30000)) {
-      Log.info("[Cloud] Send measurement buffer - regular: %s, buffer size: %lu",
+        Log.info("[Cloud] Send measurement buffer - regular: %s, buffer size: %lu",
         regularPublish ? "Yes" : "No", publish_buffer_count);
 
-      // publish buffer data
-      for (unsigned int i = 0; i < publish_buffer_count; i++) {
-        sprintf(publishString,
+        // publish buffer data
+        for (unsigned int i = 0; i < publish_buffer_count; i++) {
+            sprintf(publishString,
                 "{\"cm\": %u, \"regular\": %d, \"createdAt\": %lu000}",
                 publish_buffer[i].distance,
                 publish_buffer[i].regular ? 1 : 0,
                 publish_buffer[i].timestamp);
-        Log.info("[Cloud] Send measurement %d: %s", i, publishString);
-        Particle.publish("water-sensor", publishString, PRIVATE);
-        delay(1000);
-      }
+            Log.info("[Cloud] Send measurement %d: %s", i, publishString);
+            Particle.publish("water-sensor", publishString, PRIVATE);
+            delay(1000);
+        }
 
-      // empty publish buffer
-      memset(publish_buffer, 0, sizeof(publish_buffer));
-      publish_buffer_count = 0;
+        // MQTT publish
+        if (!mqttClient.isConnected()) {
+          reconnect();
+        }
+        mqttClient.loop();
+        boolean mqttSuccess = postToMQTT(publish_buffer[publish_buffer_count - 1].distance);
+        Log.info("[MQTT] Successfull %s", mqttSuccess ? "Yes" : "No");
+        postStatusToMQTT();
 
-      // publish some system condition data
-      sprintf(publishString,
+        // empty publish buffer
+        memset(publish_buffer, 0, sizeof(publish_buffer));
+        publish_buffer_count = 0;
+
+        // publish some system condition data
+        sprintf(publishString,
               "{\"wifi\": %d, \"v\": %.2f, \"soc\": %.2f, \"alert\": %d}",
               WiFi.RSSI(), lipo.getVoltage(), lipo.getSOC(), lipo.getAlert());
-      boolean publishSuccess = Particle.publish("tech-water-sensor", publishString, PRIVATE);
-      Log.info("[Cloud] Successfull: %s", publishSuccess ? "Yes" : "No");
+        boolean publishSuccess = Particle.publish("tech-water-sensor", publishString, PRIVATE);
+        Log.info("[Cloud] Successfull: %s", publishSuccess ? "Yes" : "No");
     } else {
         // if the buffer still has some space left we can go ahead and try later
         Log.error("[Cloud] Failed, connect timeout.");
@@ -276,4 +294,51 @@ void ping(pin_t trig_pin, pin_t echo_pin, int i) {
   distance[i] = cm;
 
   delay(100);
+}
+
+bool postToMQTT(unsigned int cm) {
+    sprintf(publishString, "%u", cm);
+    return mqttClient.publish(sensorName + "/water/cm", (uint8_t*)publishString, strlen(publishString), true);
+}
+
+void postStatusToMQTT() {
+    // convert RSSI to %
+    uint8_t quality;
+    int rssi = WiFi.RSSI();
+    if (rssi <= -100) {
+        quality = 0;
+    } else if (rssi >= -50) {
+        quality = 100;
+    } else {
+        quality = 2 * (rssi + 100);
+    }
+    sprintf(publishString, "%d", quality);
+    mqttClient.publish(sensorName + "/$stats/signal", (uint8_t*)publishString, strlen(publishString), true);
+    sprintf(publishString, "%d", millis() / 1000UL);
+    mqttClient.publish(sensorName + "/$stats/uptime", (uint8_t*)publishString, strlen(publishString), true);
+    sprintf(publishString, "%.2f", lipo.getVoltage());
+    mqttClient.publish(sensorName + "/$stats/batteryV", (uint8_t*)publishString, strlen(publishString), true);
+    sprintf(publishString, "%.2f", lipo.getSOC());
+    mqttClient.publish(sensorName + "/$stats/batterySOC", (uint8_t*)publishString, strlen(publishString), true);
+    sprintf(publishString, "%d", lipo.getAlert());
+    mqttClient.publish(sensorName + "/$stats/batteryAlert", (uint8_t*)publishString, strlen(publishString), true);
+}
+
+// MQTT connect helper
+void reconnect() {
+  while (!mqttClient.isConnected()) {
+    Log.info("[MQTT] Attempting MQTT connection...");
+    if (mqttClient.connect(sensorName)) {
+      Log.info("[MQTT] connected");
+      mqttClient.subscribe("inTopic");
+    } else {
+      Log.info("[MQTT] connect failed, try again in 5 seconds");
+      delay(5000);
+    }
+  }
+}
+
+// MQTT recieve message
+void callback(char* topic, byte* payload, unsigned int length) {
+    // not used
 }
