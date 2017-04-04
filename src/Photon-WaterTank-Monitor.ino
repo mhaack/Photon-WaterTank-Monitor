@@ -37,7 +37,7 @@ retained Measurement  publish_buffer[PUBLISH_BUFFER_SIZE];
 // measurement and publish interval
 const unsigned int MEASUREMENT_INTERVAL       = 60 * 60;      // 1 hour for normal readings
 const unsigned int MEASUREMENT_INTERVAL_SHORT = 60 * 5;       // 5 minutes for readings if values changing
-const unsigned int PUBLISH_INTERVAL           = 4 * 60 * 60;  // 4 hour as regular publish interval
+const unsigned int PUBLISH_INTERVAL           = 6 * 60 * 60;  // 6 hour as regular publish interval
 
 // MQTT
 void callback(char* topic, byte* payload, unsigned int length);
@@ -140,7 +140,7 @@ int sleepTime(bool regular) {
 // the setup
 void setup() {
   Serial.begin(115200);
-  delay(5000);
+  delay(1000);
   Log.info("Water Tank Monitor");
   Log.info("[System] Version: %s", (const char*)System.version());
 
@@ -230,8 +230,8 @@ void loop() {
                 publish_buffer[i].regular ? 1 : 0,
                 publish_buffer[i].timestamp);
             Log.info("[Cloud] Send measurement %d: %s", i, publishString);
-            Particle.publish("water-sensor", publishString, PRIVATE);
-            delay(1000);
+            Particle.publish(sensorName, publishString, PRIVATE);
+            delay(2000);
         }
 
         // MQTT publish
@@ -251,7 +251,7 @@ void loop() {
         sprintf(publishString,
               "{\"wifi\": %d, \"v\": %.2f, \"soc\": %.2f, \"alert\": %d}",
               WiFi.RSSI(), lipo.getVoltage(), lipo.getSOC(), lipo.getAlert());
-        boolean publishSuccess = Particle.publish("tech-water-sensor", publishString, PRIVATE);
+        boolean publishSuccess = Particle.publish("tech-" + sensorName, publishString, PRIVATE);
         Log.info("[Cloud] Successfull: %s", publishSuccess ? "Yes" : "No");
     } else {
         // if the buffer still has some space left we can go ahead and try later
@@ -312,16 +312,19 @@ void postStatusToMQTT() {
     } else {
         quality = 2 * (rssi + 100);
     }
+    delay(250);
     sprintf(publishString, "%d", quality);
     mqttClient.publish(sensorName + "/$stats/signal", (uint8_t*)publishString, strlen(publishString), true);
-    sprintf(publishString, "%d", millis() / 1000UL);
-    mqttClient.publish(sensorName + "/$stats/uptime", (uint8_t*)publishString, strlen(publishString), true);
+    delay(250);
     sprintf(publishString, "%.2f", lipo.getVoltage());
-    mqttClient.publish(sensorName + "/$stats/batteryV", (uint8_t*)publishString, strlen(publishString), true);
+    mqttClient.publish(sensorName + "/$stats/battery/V", (uint8_t*)publishString, strlen(publishString), true);
+    delay(250);
     sprintf(publishString, "%.2f", lipo.getSOC());
-    mqttClient.publish(sensorName + "/$stats/batterySOC", (uint8_t*)publishString, strlen(publishString), true);
+    mqttClient.publish(sensorName + "/$stats/battery/SOC", (uint8_t*)publishString, strlen(publishString), true);
+    delay(250);
     sprintf(publishString, "%d", lipo.getAlert());
-    mqttClient.publish(sensorName + "/$stats/batteryAlert", (uint8_t*)publishString, strlen(publishString), true);
+    mqttClient.publish(sensorName + "/$stats/battery/Alert", (uint8_t*)publishString, strlen(publishString), true);
+    delay(500);
 }
 
 // MQTT connect helper
