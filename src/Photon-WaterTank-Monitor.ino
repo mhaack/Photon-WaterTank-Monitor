@@ -121,6 +121,19 @@ bool calcRegularPublish() {
   Log.info("[Cloud] Check for regular publish: %s", regularPublish ? "Yes" : "No");
   return regularPublish;
 }
+// calc WiFi quality by converting RSSI to %
+uint8_t calcWifiQuality() {
+    uint8_t quality;
+    int rssi = WiFi.RSSI();
+    if (rssi <= -100) {
+        quality = 0;
+    } else if (rssi >= -50) {
+        quality = 100;
+    } else {
+        quality = 2 * (rssi + 100);
+    }
+    return quality;
+}
 
 // calc sleep time till next measurement
 int sleepTime(bool regular) {
@@ -235,13 +248,8 @@ void loop() {
         }
 
         // MQTT publish
-        if (!mqttClient.isConnected()) {
-          reconnect();
-        }
-        mqttClient.loop();
         boolean mqttSuccess = postToMQTT(publish_buffer[publish_buffer_count - 1].distance);
         Log.info("[MQTT] Successfull %s", mqttSuccess ? "Yes" : "No");
-        postStatusToMQTT();
 
         // empty publish buffer
         memset(publish_buffer, 0, sizeof(publish_buffer));
@@ -249,8 +257,8 @@ void loop() {
 
         // publish some system condition data
         sprintf(publishString,
-              "{\"wifi\": %d, \"v\": %.2f, \"soc\": %.2f, \"alert\": %d}",
-              WiFi.RSSI(), lipo.getVoltage(), lipo.getSOC(), lipo.getAlert());
+              "{\"wifi\": %u, \"v\": %.2f, \"soc\": %.2f, \"alert\": %d}",
+              calcWifiQuality(), lipo.getVoltage(), lipo.getSOC(), lipo.getAlert());
         boolean publishSuccess = Particle.publish("tech-" + sensorName, publishString, PRIVATE);
         Log.info("[Cloud] Successfull: %s", publishSuccess ? "Yes" : "No");
     } else {
@@ -269,7 +277,7 @@ void loop() {
 
 void ping(pin_t trig_pin, pin_t echo_pin, int i) {
   unsigned int duration, cm;
-  static bool  init = false;
+  static bool init = false;
 
   if (!init) {
     pinMode(trig_pin, OUTPUT);
@@ -297,23 +305,15 @@ void ping(pin_t trig_pin, pin_t echo_pin, int i) {
 }
 
 bool postToMQTT(unsigned int cm) {
-    sprintf(publishString, "%u", cm);
-    return mqttClient.publish(sensorName + "/water/cm", (uint8_t*)publishString, strlen(publishString), true);
-}
-
-void postStatusToMQTT() {
-    // convert RSSI to %
-    uint8_t quality;
-    int rssi = WiFi.RSSI();
-    if (rssi <= -100) {
-        quality = 0;
-    } else if (rssi >= -50) {
-        quality = 100;
-    } else {
-        quality = 2 * (rssi + 100);
+    if (!mqttClient.isConnected()) {
+        reconnect();
     }
+    mqttClient.loop();
+
+    sprintf(publishString, "%u", cm);
+    bool status = mqttClient.publish(sensorName + "/water/cm", (uint8_t*)publishString, strlen(publishString), true);
     delay(250);
-    sprintf(publishString, "%d", quality);
+    sprintf(publishString, "%u", calcWifiQuality());
     mqttClient.publish(sensorName + "/$stats/signal", (uint8_t*)publishString, strlen(publishString), true);
     delay(250);
     sprintf(publishString, "%.2f", lipo.getVoltage());
@@ -325,6 +325,7 @@ void postStatusToMQTT() {
     sprintf(publishString, "%d", lipo.getAlert());
     mqttClient.publish(sensorName + "/$stats/battery/Alert", (uint8_t*)publishString, strlen(publishString), true);
     delay(500);
+    return status;
 }
 
 // MQTT connect helper
