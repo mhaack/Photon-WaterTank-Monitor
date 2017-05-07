@@ -2,16 +2,21 @@
 
 // Water Tank Monitor
 //
-// Version: 1.2
+// Version: 1.3
 // Author: Markus Haack (http://github.com/mhaack)
 // -----------------------------------------
 
-#include "SparkFunMAX17043.h"
-#include "MQTT.h"
+#include <HttpClient.h>
+#include <SparkFunMAX17043.h>
+#include <MQTT.h>
+#include <math.h>
 
 SYSTEM_MODE(SEMI_AUTOMATIC);
 STARTUP(WiFi.selectAntenna(ANT_EXTERNAL));
 STARTUP(System.enableFeature(FEATURE_RETAINED_MEMORY));
+
+// global config
+const String sensorName = "watertank";
 
 // power control and sensor GPIO
 const unsigned int powerControl  = A0;
@@ -39,16 +44,170 @@ const unsigned int MEASUREMENT_INTERVAL       = 60 * 60;      // 1 hour for norm
 const unsigned int MEASUREMENT_INTERVAL_SHORT = 60 * 5;       // 5 minutes for readings if values changing
 const unsigned int PUBLISH_INTERVAL           = 6 * 60 * 60;  // 6 hour as regular publish interval
 
-// MQTT
 void callback(char* topic, byte* payload, unsigned int length);
-byte mqttServer[] = { 192,168,1,20 };
-MQTT mqttClient(mqttServer, 1883, callback);
-const String sensorName = "watertank";
+void shiftPublishBuffer(struct Measurement *arrayPtr, unsigned int size, unsigned int value, bool regular);
+
+// MQTT
+MQTT mqttClient("-xyz-", 1883, callback);
+
+// HTTP Client
+HttpClient http;
+http_request_t request;
+http_response_t response;
+http_header_t headers[] = {
+    { "Accept" , "*/*"},
+    { NULL, NULL }
+};
 
 SerialLogHandler logHandler;
 
 // particle.io publush helper
 char publishString[128];
+
+// the setup
+void setup() {
+  Serial.begin(115200);
+  delay(2000);
+  Log.info("Water Tank Monitor");
+  Log.info("[System] Version: %s", (const char*)System.version());
+
+  // Set up power for HC-SR04 sensor
+  pinMode(powerControl, OUTPUT);
+  digitalWrite(powerControl, powerState);
+
+  // init HTTP request for InfluxDB
+  request.hostname = "-xyz-";
+  request.port = 8086;
+  request.path = "/write?db=openhab_db&precision=ms&u=<user>&p=<password>";
+
+  // Set up the MAX17043 LiPo fuel gauge
+  lipo.begin();
+  lipo.wake();
+  lipo.quickStart();
+  lipo.setThreshold(10);
+  Log.info("[System] Battery: %.2f V, %.1f %%", lipo.getVoltage(), lipo.getSOC());
+
+  // inital time sync if real time is not initalized
+  Time.zone(1);
+  if (!Time.isValid()) {
+    Log.info("[System] Time sync ...");
+    Particle.connect();
+    waitUntil(Particle.connected);
+    waitFor(Time.isValid, 60000);
+    Log.info("[System] Time sync done");
+  } else {
+    Log.info("[System] Time is valid");
+  }
+  Log.info("[System] Current time is: %s", Time.format(Time.local(), TIME_FORMAT_ISO8601_FULL).c_str());
+
+}
+
+// the main loop
+void loop() {
+  // step 1: measurement
+  powerState = !powerState;
+  Log.info("[Sensor] Start measurement, senor power: %s", powerState ? "on" : "off");
+  digitalWrite(powerControl, powerState);
+  delay(250);
+
+  for (unsigned int i = 0; i < MEASUREMENTS; i++) {
+    ping(sensorTrigger, sensorEcho, i);
+    delay(50);
+    Log.info("[Sensor] Measurement %d: %u", i, distance[i]);
+    if (distance[i] > 600) {
+      Log.info("[Sensor] Invalid reading, redo measurement");
+      i--;
+    }
+  }
+  powerState = !powerState;
+  digitalWrite(powerControl, powerState);
+  Log.info("[Sensor] Measurement done, sensor power: %s", powerState ? "on" : "off");
+
+  // step 2: compare current measurement with historic values
+  unsigned int current = arrayMax(distance, MEASUREMENTS);
+  unsigned int lastMax = arrayMax(lastDistances, MEASUREMENTS);
+  unsigned int lastMin = arrayMin(lastDistances, MEASUREMENTS);
+  bool inRange         = current >= lastMin && current <= lastMax;
+  Log.info("[Sensor] current: %u, LMin: %u, LMax: %u, inRange: %s",
+                  current, lastMin, lastMax, inRange ? "Yes" : "No");
+
+  // put current value into distantce history store
+  shiftLastDistances(lastDistances, MEASUREMENTS, current);
+
+  // step 3: update publish buffer
+  bool regularMeasurement = calcRegularMeasurement();
+
+  if (regularMeasurement || !inRange) {
+    Log.info("[Memory] Store measurement - regular: %s, inRange: %s",
+        regularMeasurement ? "Yes" : "No", inRange ? "Yes" : "No");
+    shiftPublishBuffer(publish_buffer, PUBLISH_BUFFER_SIZE, current, regularMeasurement);
+    publish_buffer_count++;
+  }
+
+  // step 4: publish data to particle.io cloud
+  bool regularPublish = calcRegularPublish();
+  Log.info("[Cloud] Check for publish buffer size %u of %u",
+                  publish_buffer_count, PUBLISH_BUFFER_SIZE);
+
+  if (regularPublish || (publish_buffer_count >= PUBLISH_BUFFER_SIZE)) {
+
+    // particle cloud publish
+    Particle.connect();
+    if (waitFor(Particle.connected, 15000)) {
+        Log.info("[Cloud] Send measurement buffer - regular: %s, buffer size: %u",
+        regularPublish ? "Yes" : "No", publish_buffer_count);
+
+        // publish buffer data
+        unsigned int liter = 0;
+        for (unsigned int i = 0; i < publish_buffer_count; i++) {
+            liter = M_PI * 10000 * map(publish_buffer[i].distance, 55, 241, 186, 0) / 1000;
+            sprintf(publishString,
+                "{\"cm\": %u, \"liter\": %u, \"regular\": %d, \"createdAt\": %lu000}",
+                publish_buffer[i].distance, liter, publish_buffer[i].regular ? 1 : 0, publish_buffer[i].timestamp);
+            Log.info("[Cloud] Send measurement %d: %s", i, publishString);
+            boolean publishSuccess = Particle.publish(sensorName, publishString, PRIVATE);
+            Log.info("[Cloud] Successfull: %s", publishSuccess ? "Yes" : "No");
+
+            // send HTTP post to database
+            request.body = "Sensor_Watertank_Liter liter=" + String(liter) + " " + String(publish_buffer[i].timestamp) + "000";
+            Log.info("[HTTP] Send measurement %d: %s", i, request.body.c_str());
+            http.post(request, response, headers);
+            Log.info("[HTTP] Response: %d", response.status);
+
+            delay(2000);
+        }
+
+        // publish some system condition data
+        sprintf(publishString,
+              "{\"wifi\": %u, \"v\": %.2f, \"soc\": %.2f, \"alert\": %d}",
+              calcWifiQuality(), lipo.getVoltage(), lipo.getSOC(), lipo.getAlert());
+        boolean publishSuccess = Particle.publish("tech-" + sensorName, publishString, PRIVATE);
+        Log.info("[Cloud] Successfull: %s", publishSuccess ? "Yes" : "No");
+
+        // MQTT publish
+        liter = M_PI * 10000 * map(publish_buffer[publish_buffer_count - 1].distance, 55, 241, 186, 0) / 1000;
+        boolean mqttSuccess = postToMQTT(publish_buffer[publish_buffer_count - 1].distance, liter);
+        Log.info("[MQTT] Successfull %s", mqttSuccess ? "Yes" : "No");
+
+        // empty publish buffer
+        memset(publish_buffer, 0, sizeof(publish_buffer));
+        publish_buffer_count = 0;
+
+        Log.info("[Cloud] Publish process finished.");
+    } else {
+        // if the buffer still has some space left we can go ahead and try later
+        Log.error("[Cloud] Failed, connect timeout.");
+        if (publish_buffer_count >= PUBLISH_BUFFER_SIZE) {
+            Log.info("[Cloud] buffer is full retry. Will lose old measurements now");
+        }
+    }
+  }
+
+  // step 5: repare sleep
+  lipo.sleep();
+  delay(50);
+  System.sleep(SLEEP_MODE_DEEP, sleepTime(inRange));
+}
 
 // shift publish buffer array and add new value
 void shiftPublishBuffer(struct Measurement *arrayPtr,
@@ -59,7 +218,7 @@ void shiftPublishBuffer(struct Measurement *arrayPtr,
   }
   arrayPtr[0].distance  = value;
   arrayPtr[0].regular   = regular;
-  arrayPtr[0].timestamp = Time.local();
+  arrayPtr[0].timestamp = Time.now(); // use GMT time here
 }
 
 // find the highest value in the measurement array
@@ -150,131 +309,6 @@ int sleepTime(bool regular) {
   return nextMeasurement - now;
 }
 
-// the setup
-void setup() {
-  Serial.begin(115200);
-  delay(1000);
-  Log.info("Water Tank Monitor");
-  Log.info("[System] Version: %s", (const char*)System.version());
-
-  // Set up power for HC-SR04 sensor
-  pinMode(powerControl, OUTPUT);
-  digitalWrite(powerControl, powerState);
-
-  // Set up the MAX17043 LiPo fuel gauge
-  lipo.begin();
-  lipo.wake();
-  lipo.quickStart();
-  lipo.setThreshold(10);
-  Log.info("[System] Battery: %.2f V, %.1f %%", lipo.getVoltage(), lipo.getSOC());
-
-  // inital time sync if real time is not initalized
-  Time.zone(1);
-  if (!Time.isValid()) {
-    Log.info("[System] Time sync ...");
-    Particle.connect();
-    waitUntil(Particle.connected);
-    waitFor(Time.isValid, 60000);
-    Log.info("[System] Time sync done");
-  } else {
-    Log.info("[System] Time is valid");
-  }
-  Log.info("[System] Current time is: %s", Time.format(Time.local(), TIME_FORMAT_ISO8601_FULL).c_str());
-
-}
-
-// the main loop
-void loop() {
-  // step 1: measurement
-  powerState = !powerState;
-  Log.info("[Sensor] Start mesuarement, senor power: %s", powerState ? "on" : "off");
-  digitalWrite(powerControl, powerState);
-  delay(250);
-
-  for (unsigned int i = 0; i < MEASUREMENTS; i++) {
-    ping(sensorTrigger, sensorEcho, i);
-    delay(100);
-    Log.info("[Sensor] Measurement %d: %lu", i, distance[i]);
-  }
-  powerState = !powerState;
-  digitalWrite(powerControl, powerState);
-  Log.info("[Sensor] Mesuarement done, sensor power: %s", powerState ? "on" : "off");
-
-  // step 2: compare current measurement with historic values
-  unsigned int current = arrayMax(distance, MEASUREMENTS);
-  unsigned int lastMax = arrayMax(lastDistances, MEASUREMENTS);
-  unsigned int lastMin = arrayMin(lastDistances, MEASUREMENTS);
-  bool inRange         = current >= lastMin && current <= lastMax;
-  Log.info("[Sensor] current: %lu, LMin: %lu, LMax: %lu, inRange: %s",
-                  current, lastMin, lastMax, inRange ? "Yes" : "No");
-
-  // put current value into distantce history store
-  shiftLastDistances(lastDistances, MEASUREMENTS, current);
-
-  // step 3: update publish buffer
-  bool regularMeasurement = calcRegularMeasurement();
-
-  if (regularMeasurement || !inRange) {
-    Log.info("[Memory] Store measurement - regular: %s, inRange: %s",
-        regularMeasurement ? "Yes" : "No", inRange ? "Yes" : "No");
-    shiftPublishBuffer(publish_buffer, PUBLISH_BUFFER_SIZE,
-                       current, regularMeasurement);
-    publish_buffer_count++;
-  }
-
-  // step 4: publish data to particle.io cloud
-  bool regularPublish = calcRegularPublish();
-  Log.info("[Cloud] Check for publish buffer size %lu of %lu",
-                  publish_buffer_count, PUBLISH_BUFFER_SIZE);
-
-  if (regularPublish || (publish_buffer_count >= PUBLISH_BUFFER_SIZE)) {
-
-    // particle cloud publish
-    Particle.connect();
-    if (waitFor(Particle.connected, 30000)) {
-        Log.info("[Cloud] Send measurement buffer - regular: %s, buffer size: %lu",
-        regularPublish ? "Yes" : "No", publish_buffer_count);
-
-        // publish buffer data
-        for (unsigned int i = 0; i < publish_buffer_count; i++) {
-            sprintf(publishString,
-                "{\"cm\": %u, \"regular\": %d, \"createdAt\": %lu000}",
-                publish_buffer[i].distance,
-                publish_buffer[i].regular ? 1 : 0,
-                publish_buffer[i].timestamp);
-            Log.info("[Cloud] Send measurement %d: %s", i, publishString);
-            Particle.publish(sensorName, publishString, PRIVATE);
-            delay(2000);
-        }
-
-        // MQTT publish
-        boolean mqttSuccess = postToMQTT(publish_buffer[publish_buffer_count - 1].distance);
-        Log.info("[MQTT] Successfull %s", mqttSuccess ? "Yes" : "No");
-
-        // empty publish buffer
-        memset(publish_buffer, 0, sizeof(publish_buffer));
-        publish_buffer_count = 0;
-
-        // publish some system condition data
-        sprintf(publishString,
-              "{\"wifi\": %u, \"v\": %.2f, \"soc\": %.2f, \"alert\": %d}",
-              calcWifiQuality(), lipo.getVoltage(), lipo.getSOC(), lipo.getAlert());
-        boolean publishSuccess = Particle.publish("tech-" + sensorName, publishString, PRIVATE);
-        Log.info("[Cloud] Successfull: %s", publishSuccess ? "Yes" : "No");
-    } else {
-        // if the buffer still has some space left we can go ahead and try later
-        Log.error("[Cloud] Failed, connect timeout.");
-        if (publish_buffer_count >= PUBLISH_BUFFER_SIZE) {
-            Log.info("[Cloud] buffer is full retry. Will lose old measurements now");
-        }
-    }
-  }
-
-  // step 5: repare sleep
-  lipo.sleep();
-  System.sleep(SLEEP_MODE_DEEP, sleepTime(inRange));
-}
-
 void ping(pin_t trig_pin, pin_t echo_pin, int i) {
   unsigned int duration, cm;
   static bool init = false;
@@ -304,7 +338,8 @@ void ping(pin_t trig_pin, pin_t echo_pin, int i) {
   delay(100);
 }
 
-bool postToMQTT(unsigned int cm) {
+// post last measurement and status to MQTT
+bool postToMQTT(unsigned int cm, unsigned int liter) {
     if (!mqttClient.isConnected()) {
         reconnect();
     }
@@ -312,6 +347,9 @@ bool postToMQTT(unsigned int cm) {
 
     sprintf(publishString, "%u", cm);
     bool status = mqttClient.publish(sensorName + "/water/cm", (uint8_t*)publishString, strlen(publishString), true);
+    delay(250);
+    sprintf(publishString, "%u", liter);
+    status = mqttClient.publish(sensorName + "/water/liter", (uint8_t*)publishString, strlen(publishString), true);
     delay(250);
     sprintf(publishString, "%u", calcWifiQuality());
     mqttClient.publish(sensorName + "/$stats/signal", (uint8_t*)publishString, strlen(publishString), true);
